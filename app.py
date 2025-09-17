@@ -15,6 +15,36 @@ from sklearn.model_selection import train_test_split
 # Helpers and cached functions
 # -----------------------------
 
+def _read_csv_with_fallback(path: Path):
+    last_err = None
+    for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
+        try:
+            return pd.read_csv(path, encoding=enc), enc
+        except Exception as e:
+            last_err = e
+    try:
+        return pd.read_csv(path, encoding="latin-1", engine="python", on_bad_lines="skip"), "latin-1 (python, skip bad lines)"
+    except Exception as e:
+        raise e if last_err is None else last_err
+
+def _find_csv(filename: str) -> Path | None:
+    """Search sensible locations so bundled CSVs load even if Streamlit is launched from elsewhere."""
+    candidates = []
+    try:
+        script_dir = Path(__file__).parent.resolve()
+        candidates += [script_dir / filename, script_dir / "data" / filename, script_dir / "nigel" / filename]
+    except NameError:
+        pass
+
+    cwd = Path.cwd().resolve()
+    candidates += [cwd / filename, cwd / "data" / filename, cwd / "nigel" / filename,
+                   cwd.parent / filename, cwd.parent / "data" / filename, cwd.parent / "nigel" / filename]
+
+    for p in candidates:
+        if p.exists() and p.is_file():
+            return p.resolve()
+    return None
+
 def _parse_tokens(value, mode: str) -> List[str]:
 	"""Parse a cell into list of tokens based on user-selected mode.
 
@@ -167,20 +197,64 @@ def _read_csv_with_fallback(path: Path) -> Tuple[pd.DataFrame, str]:
 		raise e if last_err is None else last_err
 
 # Load data from bundled file only
-if not use_bundled:
-	st.error("Bundled WLSA_NN.csv not found. Please add nigel/WLSA_NN.csv and reload the app.")
-	st.stop()
-try:
-	df_raw, used_enc = _read_csv_with_fallback(default_path)
-	st.caption(f"Loaded bundled dataset: {default_path} (encoding: {used_enc})")
-except Exception as e:
-	st.error(f"Failed to read bundled WLSA_NN.csv with fallback encodings: {e}")
-	st.stop()
+# ===================== DUAL CSV LOAD (REPLACE your single-file section) =====================
 
+# ✅ UPDATE HERE: filenames only (keep them in the repo next to app.py, or in /data or /nigel)
+WINE_FILE = "WLSA_NN.csv"         # your main wine notes data
+FOOD_FILE = "food_choices.csv"    # your second CSV (food choices / curated queries)
+
+wine_csv_path = _find_csv(WINE_FILE)
+food_csv_path = _find_csv(FOOD_FILE)
+
+missing = []
+if wine_csv_path is None:
+    missing.append(WINE_FILE)
+if food_csv_path is None:
+    missing.append(FOOD_FILE)
+
+if missing:
+    st.error(
+        "Couldn’t find these required files:\n"
+        + "\n".join(f"- {m}" for m in missing)
+        + "\n\nI looked in:\n"
+        "- the script folder (and its `data/` and `nigel/` subfolders)\n"
+        "- the current working directory (and its `data/` and `nigel/` subfolders)\n"
+        "- one folder up"
+    )
+    st.stop()
+
+try:
+    df_food, used_enc_food = _read_csv_with_fallback(food_csv_path)
+    st.caption(f"Loaded food dataset: {food_csv_path} (encoding: {used_enc_food})")
+except Exception as e:
+    st.error(f"Failed to read `{food_csv_path}`: {e}")
+    st.stop()
+
+st.caption(f"Working directory: {Path.cwd().resolve()}")
 st.subheader("Preview of bundled data")
 st.dataframe(df_raw.head(10), use_container_width=True)
+st.dataframe(df_food.head(10), use_container_width=True)
+# ============================================================================================
 
-all_cols = list(df_raw.columns)
+# These already exist in your code — keep them
+default_token_col = "Notes"   # <- UPDATE if your wine text column is different
+default_name_col  = "Wines"   # <- UPDATE if your wine name column is different
+
+# ===== Food CSV column mapping (ADD after the dual-file load) =====
+# ✅ UPDATE HERE if your second CSV uses different column names
+FOOD_NAME_COL = "Food"          # e.g., "Food", "Label", "Dish"
+FOOD_DESC_COL = "Description"   # e.g., "Description", "Query", "Text"
+
+# Validate presence once, fail fast with a clear message
+missing_food_cols = [c for c in (FOOD_NAME_COL, FOOD_DESC_COL) if c not in df_food.columns]
+if missing_food_cols:
+    st.error(
+        "Your food CSV is missing required columns:\n"
+        + "\n".join(f"- {c}" for c in missing_food_cols)
+        + "\n\nUpdate FOOD_NAME_COL / FOOD_DESC_COL in the code to match your file."
+    )
+    st.stop()
+# ================================================================st
 
 # Choose columns using defaults with simple fallbacks
 token_col = default_token_col if default_token_col in all_cols else None
