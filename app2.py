@@ -1,7 +1,7 @@
 import ast
 from pathlib import Path
 from typing import Dict, List, Tuple
-
+import re
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -14,6 +14,166 @@ from sklearn.model_selection import train_test_split
 # -----------------------------
 # Helpers and cached functions
 # -----------------------------
+
+# 1) Load custom stopwords (one token per line) and merge with English
+def load_stopwords_file(path: Path) -> set:
+    if not path.exists():
+        return set()
+    words = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        w = line.strip().lower()
+        if w:
+            words.add(w)
+    return words
+
+@st.cache_resource
+def build_models(train_df, test_df, food_choices, stopwords_path: Path):
+    # wine texts are already lemmatized lists in your dataframes
+    train_texts = train_df["Description_lemmatized"].apply(lambda toks: " ".join(toks))
+    test_texts  = test_df["Description_lemmatized"].apply(lambda toks: " ".join(toks))
+    wine_texts_all = list(train_texts) + list(test_texts)
+
+    # custom stopwords
+    custom_sw = load_stopwords_file(stopwords_path)
+    # IMPORTANT: do not include domain words in stopwords (fish, seafood, spicy, grilled, smoky, citrus, nutty, creamy, etc.)
+    stop_words = "english"  # we’ll pass english + custom via a set below
+    # We'll construct a real set after we fit the vectorizer to get its english list
+    # (sklearn uses a built-in list when stop_words="english").
+
+    # word-level TF-IDF + char-level TF-IDF
+    word_vec = TfidfVectorizer(stop_words="english", min_df=1, max_df=0.95, ngram_range=(1,2), norm="l2")
+    char_vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(3,5), min_df=1, norm="l2")
+
+    # Fit on wines first to get vocab + english stop list, then refit with union stopwords and foods included
+    word_vec.fit(wine_texts_all)
+    english_sw = set(getattr(word_vec, "stop_words_", []))
+    full_sw = english_sw | custom_sw
+
+    word_vec = TfidfVectorizer(stop_words=full_sw, min_df=1, max_df=0.95, ngram_range=(1,2), norm="l2")
+    word_vec.fit(wine_texts_all + [desc for desc in food_choices.values()])  # align vocab with foods
+    char_vec.fit(wine_texts_all)
+
+    # Transform wines
+    X_train_word = word_vec.transform(train_texts)
+    X_test_word  = word_vec.transform(test_texts)
+    X_train_char = char_vec.transform(train_texts)
+    X_test_char  = char_vec.transform(test_texts)
+
+    # Store on copies (keep as sparse matrices; no .toarray())
+    train_copy = train_df.copy()
+    test_copy  = test_df.copy()
+    train_copy["vec_word"] = list(X_train_word)
+    train_copy["vec_char"] = list(X_train_char)
+    test_copy["vec_word"]  = list(X_test_word)
+    test_copy["vec_char"]  = list(X_test_char)
+
+    # small synonym map -> only keep synonyms that exist in the wine vocab
+    wine_vocab = set(word_vec.get_feature_names_out())
+    raw_synonyms = {
+        # taste / mouthfeel
+        "spicy": ["spice", "pepper", "peppery", "ginger", "clove", "cinnamon", "cardamom"],
+        "creamy": ["creamy", "buttery", "silky", "round"],
+        "oily":   ["oily", "rich"],
+        "sweet":  ["sweet", "honey", "ripe"],
+        "sour":   ["acid", "acidity", "tart", "zesty"],
+        "bitter": ["bitter", "almond"],
+        "umami":  ["savory"],
+
+        # aroma / cooking
+        "smoky":  ["smoke", "smoky", "char", "toasty"],
+        "grilled":["smoke", "smoky", "char", "toasty"],
+        "fried":  ["rich"],
+        "curry":  ["spice", "turmeric", "coriander", "cumin"],
+        "chili":  ["pepper", "peppery", "spice"],
+        "peanut": ["nutty", "hazelnut", "almond"],
+        "herbs":  ["herbal", "sage", "rosemary", "thyme", "basil", "mint"],
+        "ginger": ["ginger", "spice"],
+        "coconut":["tropical", "creamy"],
+        "lemon":  ["citrus", "lemon", "zest"],
+        "lime":   ["citrus", "lime", "zest"],
+        "orange": ["citrus", "orange", "zest"],
+        "floral": ["floral", "rose", "jasmine", "acacia"],
+        "vanilla":["vanilla"],
+
+        # sea / stock
+        "seafood":["saline", "briny", "mineral"],
+        "shellfish":["saline", "briny", "oyster"],
+        "prawn":  ["saline", "briny"],
+        "squid":  ["saline", "briny"],
+        "broth":  ["savory", "herbal"],
+
+        # starchy / bready
+        "rice":   ["biscuit", "bread", "cereal"],
+        "toast":  ["toasty"],
+    }
+    synonyms = {k: [w for w in v if w in wine_vocab] for k, v in raw_synonyms.items()}
+
+    return word_vec, char_vec, train_copy, test_copy, synonyms, wine_vocab
+
+def _normalize_food(s: str) -> str:
+    s = s.lower()
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    # tiny stemming-ish tweaks to line up with wine lemmas
+    toks = s.split()
+    out = []
+    for t in toks:
+        if t.endswith("ies"): out.append(t[:-3] + "y")
+        elif t.endswith("ing"): out.append(t[:-3])
+        elif t.endswith("ed"): out.append(t[:-2])
+        elif t.endswith("s") and len(t) > 3: out.append(t[:-1])
+        else: out.append(t)
+    return " ".join(out)
+
+def _translate_food_to_wine_query(s: str, synonyms: dict, wine_vocab: set) -> str:
+    s = _normalize_food(s)
+    toks = s.split()
+    out = []
+    i = 0
+    while i < len(toks):
+        if i+1 < len(toks):  # bigram first
+            bigram = f"{toks[i]} {toks[i+1]}"
+            if bigram in synonyms:
+                out.extend(synonyms[bigram]); i += 2; continue
+        t = toks[i]
+        if t in wine_vocab:
+            out.append(t)
+        if t in synonyms:
+            out.extend(synonyms[t])
+        i += 1
+    if not out:
+        out = [t for t in toks if t in wine_vocab]
+    return " ".join(out)
+
+def _food_vecs(food_desc: str, word_vec, char_vec, synonyms, wine_vocab):
+    q = _translate_food_to_wine_query(food_desc, synonyms, wine_vocab)
+    vw = word_vec.transform([q])
+    vc = char_vec.transform([_normalize_food(food_desc)])
+    return vw, vc
+
+def _cosine_ensemble(vw_query, vc_query, vw_doc, vc_doc, w_word=0.65, w_char=0.35):
+    sw = cosine_similarity(vw_query, vw_doc)[0][0]
+    sc = cosine_similarity(vc_query, vc_doc)[0][0]
+    return w_word*sw + w_char*sc
+
+def rank_wines_for_food(food_desc: str, df, word_vec, char_vec, synonyms, wine_vocab, k=5, pct_display=True):
+    qw, qc = _food_vecs(food_desc, word_vec, char_vec, synonyms, wine_vocab)
+    scores = []
+    for _, row in df.iterrows():
+        s = _cosine_ensemble(qw, qc, row["vec_word"], row["vec_char"])
+        scores.append((row["BottleName"], s))
+    scores.sort(key=lambda t: t[1], reverse=True)
+    top = scores[:k]
+    if pct_display:
+        # scale to 0..100 within this query for user-friendly %s
+        vals = np.array([s for _, s in top])
+        if vals.size and vals.max() > 0:
+            disp = 100.0 * (vals / vals.max())
+        else:
+            disp = np.zeros_like(vals)
+        return [(name, float(round(p, 2)), float(score)) for (name, score), p in zip(top, disp)]
+    else:
+        return [(name, float(score)) for name, score in top]
 
 def _parse_tokens(value, mode: str) -> List[str]:
 	"""Parse a cell into list of tokens based on user-selected mode.
