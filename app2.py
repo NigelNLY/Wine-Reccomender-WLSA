@@ -314,17 +314,67 @@ splitter = "space"
 
 # Robust CSV reader to handle encodings
 def _read_csv_with_fallback(path: Path) -> Tuple[pd.DataFrame, str]:
-	last_err = None
-	for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
-		try:
-			return pd.read_csv(path, encoding=enc), enc
-		except Exception as e:
-			last_err = e
-	# Final fallback: python engine with bad line skipping
-	try:
-		return pd.read_csv(path, encoding="latin-1", engine="python", on_bad_lines="skip"), "latin-1 (python, skip bad lines)"
-	except Exception as e:
-		raise e if last_err is None else last_err
+    last_err = None
+    for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
+        try:
+            return pd.read_csv(path, encoding=enc), enc
+        except Exception as e:
+            last_err = e
+    # Final fallback: python engine with bad line skipping
+    try:
+        return pd.read_csv(path, encoding="latin-1", engine="python", on_bad_lines="skip"), \
+               "latin-1 (python, skip bad lines)"
+    except Exception as e:
+        raise e if last_err is None else last_err
+
+# ---------- small cached wrapper so Streamlit doesn't re-read every rerun ----------
+@st.cache_data(show_spinner=False)
+def load_csv_cached(path_str: str) -> Tuple[pd.DataFrame, str]:
+    df, enc = _read_csv_with_fallback(Path(path_str))
+    # optional: normalize column names
+    df.columns = [c.strip() for c in df.columns]
+    return df, enc
+
+# ---------- locate your files (bundle them under ./data next to app.py) ----------
+DATA_DIR = Path(__file__).parent / "data"
+WINES_PATH = DATA_DIR / "WLSA_NN.csv"
+FOOD_PATH  = DATA_DIR / "food_choices.csv"
+
+st.title("Wine Recommender")
+
+# Try local files first; if missing, fall back to uploaders
+wines_df = None
+food_df  = None
+enc_wines = enc_food = None
+
+if WINES_PATH.exists() and FOOD_PATH.exists():
+    wines_df, enc_wines = load_csv_cached(str(WINES_PATH))
+    food_df,  enc_food  = load_csv_cached(str(FOOD_PATH))
+else:
+    st.warning("Local CSVs not found. Upload them below:")
+    u_wines = st.file_uploader("Upload wines.csv", type="csv", key="wines_up")
+    u_food  = st.file_uploader("Upload food_choices.csv", type="csv", key="food_up")
+    if u_wines is not None and u_food is not None:
+        wines_df = pd.read_csv(u_wines)
+        food_df  = pd.read_csv(u_food)
+        enc_wines = enc_food = "uploaded"
+
+# Stop early if we still don't have both
+if wines_df is None or food_df is None:
+    st.stop()
+
+# Show quick status
+st.caption(
+    f"Loaded wines.csv ({enc_wines}) — {len(wines_df):,} rows • "
+    f"food_choices.csv ({enc_food}) — {len(food_df):,} rows"
+)
+
+# Example: dropdown for food names from food_choices.csv
+# Expecting columns like: name, description
+food_name = st.selectbox("Pick a dish", options=food_df["name"].tolist())
+food_desc = food_df.loc[food_df["name"] == food_name, "description"].iloc[0]
+
+st.write("Food description:", food_desc)
 
 # Load data from bundled file only
 if not use_bundled:
