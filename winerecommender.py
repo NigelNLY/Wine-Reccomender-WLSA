@@ -15,6 +15,34 @@ from sklearn.model_selection import train_test_split
 # Helpers and cached functions
 # -----------------------------
 
+def _find_csv(filename: str) -> Path | None:
+    """Search common local locations for a CSV."""
+    candidates = []
+    try:
+        script_dir = Path(__file__).parent.resolve()
+        candidates += [
+            script_dir / filename,
+            script_dir / "data" / filename,
+            script_dir / "nigel" / filename,
+        ]
+    except NameError:
+        pass
+
+    cwd = Path.cwd().resolve()
+    candidates += [
+        cwd / filename,
+        cwd / "data" / filename,
+        cwd / "nigel" / filename,
+        cwd.parent / filename,
+        cwd.parent / "data" / filename,
+        cwd.parent / "nigel" / filename,
+    ]
+
+    for p in candidates:
+        if p.exists() and p.is_file():
+            return p.resolve()
+    return None
+
 # 1) Load custom stopwords (one token per line) and merge with English
 def load_stopwords_file(path: Path) -> set:
     if not path.exists():
@@ -287,10 +315,10 @@ def find_closest_sentence(
 # -----------------------------
 
 #EDIT 
-st.set_page_config(page_title="Food → Wine Recommender", page_icon="🍷", layout="wide")
+st.set_page_config(page_title="Wine List Asia Wine Recommender", page_icon="🍷", layout="wide")
 st.title("🍷 Food → Wine Recommender")
 st.write(
-	"Train a TF-IDF model on your dataset and get wine recommendations by matching food descriptions to the closest wine descriptions."
+	"Select from our dropdown box a list of food you wish to know a wine suitable for it."
 )
 
 # Defaults (no sidebar controls) #EDIT
@@ -343,6 +371,7 @@ FOOD_PATH  = DATA_DIR / "food_choices.csv"
 st.title("Wine Recommender")
 
 # Try local files first; if missing, fall back to uploaders
+# Local files only
 wines_df = None
 food_df  = None
 enc_wines = enc_food = None
@@ -351,17 +380,15 @@ if WINES_PATH.exists() and FOOD_PATH.exists():
     wines_df, enc_wines = load_csv_cached(str(WINES_PATH))
     food_df,  enc_food  = load_csv_cached(str(FOOD_PATH))
 else:
-    st.warning("Local CSVs not found. Upload them below:")
-    u_wines = st.file_uploader("Upload wines.csv", type="csv", key="wines_up")
-    u_food  = st.file_uploader("Upload food_choices.csv", type="csv", key="food_up")
-    if u_wines is not None and u_food is not None:
-        wines_df = pd.read_csv(u_wines)
-        food_df  = pd.read_csv(u_food)
-        enc_wines = enc_food = "uploaded"
-
-# Stop early if we still don't have both
-if wines_df is None or food_df is None:
-    st.stop()
+    # (optional) broader local search using _find_csv
+    w = _find_csv("WLSA_NN.csv")
+    f = _find_csv("food_choices.csv")
+    if w and f:
+        wines_df, enc_wines = _read_csv_with_fallback(w)
+        food_df,  enc_food  = _read_csv_with_fallback(f)
+    else:
+        st.error("Local CSVs not found. Place WLSA_NN.csv and food_choices.csv next to app.py or under ./data or ./nigel.")
+        st.stop()
 
 # Show quick status
 st.caption(
@@ -369,26 +396,15 @@ st.caption(
     f"food_choices.csv ({enc_food}) — {len(food_df):,} rows"
 )
 
-# Example: dropdown for food names from food_choices.csv
-# Expecting columns like: name, description
-food_name = st.selectbox("Pick a dish", options=food_df["name"].tolist())
-food_desc = food_df.loc[food_df["name"] == food_name, "description"].iloc[0]
+# Use the loaded frames everywhere below
+df_raw = wines_df.copy()
+df_food = food_df.copy()
+all_cols = list(df_raw.columns)
 
-st.write("Food description:", food_desc)
-
-# Load data from bundled file only
-if not use_bundled:
-	st.error("Bundled WLSA_NN.csv not found. Please add nigel/WLSA_NN.csv and reload the app.")
-	st.stop()
-try:
-	df_raw, used_enc = _read_csv_with_fallback(default_path)
-	st.caption(f"Loaded bundled dataset: {default_path} (encoding: {used_enc})")
-except Exception as e:
-	st.error(f"Failed to read bundled WLSA_NN.csv with fallback encodings: {e}")
-	st.stop()
-
-st.subheader("Preview of bundled data")
+# Optional preview
+st.subheader("Data Showcase")
 st.dataframe(df_raw.head(10), use_container_width=True)
+
 
 all_cols = list(df_raw.columns)
 
@@ -420,7 +436,6 @@ if name_col is None:
 	# fallback to the first non-token column
 	name_col = all_cols[0] if all_cols[0] != token_col else (all_cols[1] if len(all_cols) > 1 else all_cols[0])
 
-st.write(f"Using text column: `{token_col}` and name column: `{name_col}`")
 
 # Parse tokens into a new column and build text for TF-IDF
 tokenized_col = f"{token_col}__tokens"
@@ -447,90 +462,176 @@ train_df, test_df = split_data(df[[name_col, tokenized_col, text_col]].copy(), t
 
 # Train TF-IDF on training set texts
 train_texts: List[str] = train_df[text_col].tolist()
-with st.spinner("Fitting TF-IDF vectorizer..."):
-	vectorizer = train_vectorizer(
-		texts=train_texts,
-		max_features=int(max_features),
-		ngram_range=(1, int(ngram_max)),
-		min_df=int(min_df),
-		max_df=float(max_df),
-	)
+food_name_cand = None
+food_desc_cand = None
+for cand_name, cand_desc in (("Food", "Description"), ("name", "description"), ("Label", "Description")):
+    if cand_name in df_food.columns and cand_desc in df_food.columns:
+        food_name_cand, food_desc_cand = cand_name, cand_desc
+        break
+if food_desc_cand is None:
+    # fallback: first string column
+    str_cols = [c for c in df_food.columns if pd.api.types.is_string_dtype(df_food[c])]
+    food_desc_cand = str_cols[1] if len(str_cols) > 1 else str_cols[0]
+
+# Prefer a precomputed normalized column if you added one; else use desc
+query_series = (
+    df_food["Normalized_Description"]
+    if "Normalized_Description" in df_food.columns
+    else df_food[food_desc_cand]
+).fillna("").astype(str)
+
+with st.spinner("Fitting vectorizers (word + char) on wines + food queries..."):
+    vocab_fit = df[text_col].astype(str).tolist() + query_series.tolist()
+
+    # Word n-grams with better settings for short texts
+    vectorizer = TfidfVectorizer(
+        ngram_range=(1, 2),      # add bigrams
+        min_df=2,                # drop ultra-rare junk
+        max_df=0.9,              # drop near-stopwords
+        sublinear_tf=True,       # dampen long docs
+        smooth_idf=True,         # stabler idf
+        max_features=int(max_features) if max_features else None
+    )
+    vectorizer.fit(vocab_fit)
+
+    # Character n-grams catch morphology/typos (“char_wb” respects word boundaries)
+    char_vec = TfidfVectorizer(
+        analyzer="char_wb",
+        ngram_range=(3, 5),
+        min_df=1
+    )
+    char_vec.fit(vocab_fit)
 
 # Compute matrices for train/test
-with st.spinner("Vectorizing train/test sets..."):
-	X_train = vectorizer.transform(train_df[text_col])
-	X_test = vectorizer.transform(test_df[text_col])
+with st.spinner("Vectorizing train/test sets (word + char)..."):
+    X_train_w = vectorizer.transform(train_df[text_col])
+    X_test_w  = vectorizer.transform(test_df[text_col])
+    X_train_c = char_vec.transform(train_df[text_col])
+    X_test_c  = char_vec.transform(test_df[text_col])
+
 
 st.success("Vectorizer fitted and text vectors computed.")
 
-# Query input
-st.subheader("Enter food descriptions")
-st.caption("Enter one food description per line, or upload a JSON mapping of name → description below.")
-query_lines = st.text_area(
-	"Food descriptions (one per line)",
-	value="Roast chicken with herbs\nSpicy seafood pasta\nDark chocolate dessert",
-	height=120,
+# --- Pick a food from your CSV and get recommendations ---
+# Try common column names; fail fast if not present
+FOOD_NAME_COL = None
+FOOD_DESC_COL = None
+for cand_name, cand_desc in (("Food", "Description"), ("name", "description"), ("Label", "Description")):
+    if cand_name in df_food.columns and cand_desc in df_food.columns:
+        FOOD_NAME_COL, FOOD_DESC_COL = cand_name, cand_desc
+        break
+if FOOD_NAME_COL is None:
+    st.error("Your food_choices.csv must contain columns 'Food' + 'Description' (or 'name' + 'description').")
+    st.stop()
+
+st.subheader("Select a food choice")
+food_options = (
+    df_food[FOOD_NAME_COL]
+    .dropna()
+    .astype(str)
+    .drop_duplicates()
+    .sort_values()
+    .tolist()
 )
+selected_food = st.selectbox("Food", options=food_options, index=0)
 
-food_map: Dict[str, str] = {}
+# Get the description that corresponds to the selected food
+food_desc = (
+    df_food.loc[df_food[FOOD_NAME_COL].astype(str) == str(selected_food), FOOD_DESC_COL]
+    .astype(str)
+    .iloc[0]
+)
+st.caption(f"Query used → {food_desc}")
 
-# derive from lines
-for line in [ln.strip() for ln in query_lines.splitlines() if ln.strip()]:
-    # Allow optional label|description format
-    if "|" in line:
-        label, desc = line.split("|", 1)
-        food_map[label.strip()] = desc.strip()
+# Helper to get true Top-N for a single query
+def _topn_for_query(desc: str,
+                    Xw, Xc,
+                    names: pd.Series,
+                    n: int = 5,
+                    w_word: float = 0.7,
+                    w_char: float = 0.3):
+    # use your existing normalizer
+    q_text = _normalize_query_text(desc, lowercase, splitter)
+    qw = vectorizer.transform([q_text])  # word n-grams
+    qc = char_vec.transform([q_text])    # char n-grams
+
+    sims = w_word * cosine_similarity(qw, Xw).ravel() + \
+           w_char * cosine_similarity(qc, Xc).ravel()
+
+    if sims.size == 0:
+        return []
+
+    top_idx = np.argsort(-sims)[:n]
+    max_s = sims[top_idx[0]] if top_idx.size else 0.0
+
+    rows = []
+    for rank, i in enumerate(top_idx, start=1):
+        pct = (sims[i] / max_s * 100.0) if max_s > 0 else 0.0
+        rows.append({"Rank": rank,
+                     "Wine": str(names.iloc[i]),
+                     "Cosine Similarity (%)": round(pct, 2)})
+    return rows
+
+# Make sure these exist earlier in your code:
+# X_train_w, X_test_w, X_train_c, X_test_c  (the word & char matrices)
+
+if st.button("Find recommendations"):
+    # compute top hits from each split
+    top_test = _topn_for_query(food_desc, X_test_w, X_test_c, test_df[name_col], n=5)
+    top_train = _topn_for_query(food_desc, X_train_w, X_train_c, train_df[name_col], n=5)
+
+    # DataFrames (NO "Set" tagging anymore)
+    df_test = pd.DataFrame(top_test)
+    df_train = pd.DataFrame(top_train)
+
+    # merge test+train and keep the best score per wine
+    merged_all = pd.concat([df_test, df_train], ignore_index=True)
+    if merged_all.empty:
+        st.info("No recommendations found.")
     else:
-        # Use truncated text as label
-        label = (line[:40] + "…") if len(line) > 40 else line
-        food_map[label] = line
+        collapsed = (
+            merged_all
+            .sort_values("Cosine Similarity (%)", ascending=False)
+            .drop_duplicates(subset=["Wine"], keep="first")
+            .reset_index(drop=True)
+        )
+        collapsed["Rank"] = np.arange(1, len(collapsed) + 1)
 
-num_choices = min(5, len(food_map))
-st.write(f"Detected {len(food_map)} food queries. Showing top {num_choices} recommendations.")
+        # ---- attach links from WLSA_NN.csv (df_raw) using your wine name column ----
+        LINK_COL_CANDS = ["Link", "URL", "Url", "link", "Website", "website", "Product URL", "Product_URL"]
+        link_col = next((c for c in LINK_COL_CANDS if c in df_raw.columns), None)
 
-if not food_map:
-	st.info("Add at least one food description to get recommendations.")
-	st.stop()
+        if link_col is not None:
+            # map wine -> link
+            link_map = df_raw.set_index(name_col)[link_col]
+            collapsed["Link"] = collapsed["Wine"].map(link_map).fillna("")
 
-run_btn = st.button("Find recommendations")
-
-if run_btn:
-	closest_wines_test: List[Tuple[str, float]] = []
-	closest_wines_train: List[Tuple[str, float]] = []
-
-	for food_name, food_desc in food_map.items():
-		wine_test, sim_test = find_closest_sentence(
-			food_desc, X_test, test_df[name_col], vectorizer, lowercase=lowercase, splitter=splitter
-		)
-		closest_wines_test.append((f"{food_name} → {wine_test}", sim_test))
-
-		wine_train, sim_train = find_closest_sentence(
-			food_desc, X_train, train_df[name_col], vectorizer, lowercase=lowercase, splitter=splitter
-		)
-		closest_wines_train.append((f"{food_name} → {wine_train}", sim_train))
-
-	# Sort descending by similarity
-	closest_wines_test.sort(key=lambda x: x[1], reverse=True)
-	closest_wines_train.sort(key=lambda x: x[1], reverse=True)
-
-
-#EDIT to combine both train and test dataset pd.concat
-	# Display
-	st.subheader("Top 5 wine recommendations (Test set)")
-	test_df_display = pd.DataFrame(
-		[{"Rank": i + 1, "Pairing": name, "Cosine Similarity (%)": sim} for i, (name, sim) in enumerate(closest_wines_test[:5])]
-	)
-	st.dataframe(test_df_display, use_container_width=True, hide_index=True)
-
-	st.subheader("Top 5 wine recommendations (Train set)")
-	train_df_display = pd.DataFrame(
-		[{"Rank": i + 1, "Pairing": name, "Cosine Similarity (%)": sim} for i, (name, sim) in enumerate(closest_wines_train[:5])]
-	)
-	st.dataframe(train_df_display, use_container_width=True, hide_index=True)
-
-
-st.markdown("---")
-st.caption(
-	"Developed by WineList Asiatic (https://winelistasia.com) 🍷"
-)
-
+            st.subheader("Wine Recommendations")
+            # Prefer clickable links via LinkColumn if your Streamlit is recent enough
+            try:
+                st.data_editor(
+                    collapsed[["Rank", "Wine", "Cosine Similarity (%)", "Link"]],
+                    column_config={
+                        "Link": st.column_config.LinkColumn("Link", help="Open wine page")
+                    },
+                    hide_index=True,
+                    use_container_width=True,
+                )
+            except Exception:
+                # fallback: show raw URL text
+                st.dataframe(
+                    collapsed[["Rank", "Wine", "Cosine Similarity (%)", "Link"]],
+                    hide_index=True,
+                    use_container_width=True,
+                )
+        else:
+            st.subheader("Wine Recommendations")
+            st.dataframe(
+                collapsed[["Rank", "Wine", "Cosine Similarity (%)"]],
+                hide_index=True,
+                use_container_width=True,
+            )
+            st.warning(
+                "No link column found in WLSA_NN.csv. Add one named "
+                "'Link' or 'URL' (or update LINK_COL_CANDS) to show clickable links."
+            )
